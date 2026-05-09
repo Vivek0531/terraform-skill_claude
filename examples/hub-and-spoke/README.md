@@ -6,6 +6,80 @@ A production-ready Terraform implementation of hub-and-spoke network topology us
 
 ## Architecture Diagram
 
+```mermaid
+flowchart TB
+    internet([🌐 INTERNET])
+
+    internet --> igw
+
+    subgraph hub["HUB VPC — 10.0.0.0/16 (Shared Services)"]
+        direction TB
+        subgraph pub["Public Subnets (10.0.101-103.0/24)"]
+            igw[Internet Gateway]
+            nat["NAT Gateway ×3\n(one per AZ)"]
+        end
+        subgraph priv_hub["Private Subnets (10.0.1-3.0/24)"]
+            svc["Shared Services\nDNS · Monitoring · Bastion"]
+            nfw["AWS Network Firewall\n(east-west inspection)"]
+        end
+        igw --> nat
+    end
+
+    nat <-->|"egress / return"| tgw
+    nfw <-->|"inspected traffic"| tgw
+
+    subgraph tgw_box["Transit Gateway (ASN 64512)"]
+        tgw{TGW}
+        hub_rt["Hub Route Table\n─────────────\n10.1.0.0/16 → prod\n10.2.0.0/16 → staging\n10.3.0.0/16 → dev\n10.4.0.0/16 → security"]
+        spoke_rt["Spoke Route Table\n─────────────\n0.0.0.0/0 → hub\n(all spokes share)"]
+    end
+
+    tgw --- hub_rt
+    tgw --- spoke_rt
+
+    spoke_rt --> prod_att & staging_att & dev_att & sec_att
+
+    subgraph prod["PROD VPC — 10.1.0.0/16"]
+        prod_att[TGW Attachment]
+        prod_sub["Private Subnets only\nNo IGW · NACL deny-all\nSG default-deny"]
+    end
+
+    subgraph staging["STAGING VPC — 10.2.0.0/16"]
+        staging_att[TGW Attachment]
+        staging_sub["Private Subnets only\nNo IGW · NACL deny-all\nSG default-deny"]
+    end
+
+    subgraph dev["DEV VPC — 10.3.0.0/16"]
+        dev_att[TGW Attachment]
+        dev_sub["Private Subnets only\nNo IGW · NACL deny-all\nSG default-deny"]
+    end
+
+    subgraph security["SECURITY VPC — 10.4.0.0/16"]
+        sec_att[TGW Attachment]
+        sec_sub["IDS/IPS · SIEM\nNetwork Firewall · Bastion"]
+    end
+
+    classDef vpc fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+    classDef hub fill:#fef3c7,stroke:#f59e0b,color:#78350f
+    classDef tgw fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    classDef internet fill:#d1fae5,stroke:#059669,color:#064e3b
+    class prod,staging,dev,security vpc
+    class hub,pub,priv_hub hub
+    class tgw_box,tgw,hub_rt,spoke_rt tgw
+    class internet internet
+```
+
+### Traffic Flow
+
+| Source | Destination | Path |
+|--------|-------------|------|
+| Any spoke | Internet | Spoke → TGW (spoke RT: `0.0.0.0/0→hub`) → Hub NAT GW → Internet |
+| Dev | Prod | Dev → TGW → Hub Firewall (inspection) → TGW → Prod |
+| Security | Any spoke | Security → TGW (hub RT: propagated routes) → target spoke |
+| Spoke A | Spoke B direct | **Blocked** — no spoke-to-spoke route in spoke RT; NACL deny-all |
+
+### ASCII Reference
+
 ```
                               INTERNET
                                  │
@@ -15,52 +89,31 @@ A production-ready Terraform implementation of hub-and-spoke network topology us
                                  │
             ┌────────────────────▼──────────────────────────────┐
             │               HUB VPC (10.0.0.0/16)               │
-            │                   [Shared Services]                │
-            │                                                    │
             │  ┌─────────────┐        ┌─────────────────────┐   │
-            │  │ Public Nets │        │    Private Nets      │   │
-            │  │10.0.101.0/24│        │   10.0.1-3.0/24     │   │
-            │  │10.0.102.0/24│        │                      │   │
-            │  │10.0.103.0/24│        │  - Shared Services   │   │
-            │  │  NAT GW x3  │        │  - DNS Resolvers     │   │
-            │  └─────────────┘        │  - Security Tools    │   │
-            │                         │  - Monitoring        │   │
-            └─────────────────────────┬────────────────────-─┘
-                                      │  TGW Attachment
+            │  │ NAT GW ×3   │        │  Shared Services     │   │
+            │  │Public Nets  │        │  DNS · Monitor · FW  │   │
+            │  └─────────────┘        └─────────────────────┘   │
+            └─────────────────────────┬─────────────────────────┘
+                                      │ TGW Attachment
                          ┌────────────▼────────────┐
                          │   Transit Gateway (TGW)  │
-                         │   ASN: 64512             │
-                         │                          │
                          │  ┌──────────────────┐    │
-                         │  │  Hub Route Table │    │  ← Sees all spoke CIDRs
-                         │  │  (hub attachment)│    │    via propagation
+                         │  │  Hub Route Table │◄───┼── spoke CIDRs propagated
                          │  └──────────────────┘    │
                          │  ┌──────────────────┐    │
-                         │  │ Spoke Route Table│    │  ← Default 0.0.0.0/0
-                         │  │(all spokes share)│    │    points to hub
+                         │  │ Spoke Route Table│────┼── 0.0.0.0/0 → hub
                          │  └──────────────────┘    │
-                         └────────────┬────────────-┘
-              ┌───────────────────────┼──────────────────────────┐
-              │                       │                          │
-   ┌──────────▼──────┐    ┌──────────▼──────┐    ┌─────────────▼─────┐
-   │  PROD VPC       │    │  STAGING VPC    │    │  DEV VPC           │
-   │  10.1.0.0/16    │    │  10.2.0.0/16    │    │  10.3.0.0/16      │
-   │                 │    │                 │    │                    │
-   │  Private only   │    │  Private only   │    │  Private only      │
-   │  No IGW         │    │  No IGW         │    │  No IGW            │
-   │  NACL: deny     │    │  NACL: deny     │    │  NACL: deny        │
-   │  direct spoke   │    │  direct spoke   │    │  direct spoke      │
-   └─────────────────┘    └─────────────────┘    └────────────────────┘
-
-       ┌────────────────────────────────────────────────┐
-       │                SECURITY VPC  10.4.0.0/16       │
-       │  (IDS/IPS, SIEM, Network Firewall, Bastion)    │
-       └────────────────────────────────────────────────┘
-
-Traffic flow examples:
-  Dev → Internet:   Dev VPC → TGW (spoke RT: 0.0.0.0/0 → hub) → Hub NAT GW → Internet
-  Dev → Prod:       Dev VPC → TGW (spoke RT: 0.0.0.0/0 → hub) → Hub SG/FW → TGW → Prod
-  Security → Any:   Security VPC → TGW (hub RT: propagated routes) → any spoke
+                         └──┬──────┬───────┬────────┘
+                            │      │       │
+               ┌────────────▼┐ ┌───▼──────┐▼ ┌──────────────┐
+               │  PROD VPC   │ │STAGING   │  │  DEV VPC     │
+               │ 10.1.0.0/16 │ │10.2.0/16 │  │ 10.3.0.0/16  │
+               │ Private only│ │Priv only │  │ Private only  │
+               └─────────────┘ └──────────┘  └──────────────┘
+               ┌──────────────────────────────────────────────┐
+               │         SECURITY VPC  10.4.0.0/16            │
+               │    IDS/IPS · SIEM · Network Firewall          │
+               └──────────────────────────────────────────────┘
 ```
 
 ---
