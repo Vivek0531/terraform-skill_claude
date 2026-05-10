@@ -1,0 +1,251 @@
+pipeline {
+  agent { label 'terraform' }
+
+  parameters {
+    choice(name: 'CLOUD',       choices: ['aws', 'azure'],                         description: 'Target cloud provider')
+    choice(name: 'ENVIRONMENT', choices: ['dev', 'staging', 'production'],         description: 'Target environment')
+    choice(name: 'COMPONENT',   choices: ['all', 'eks', 'kafka', 'monitoring', 'logging'], description: 'Component to deploy')
+    booleanParam(name: 'DESTROY', defaultValue: false,                             description: 'Destroy infrastructure')
+    booleanParam(name: 'AUTO_APPROVE', defaultValue: false,                        description: 'Skip plan approval (non-prod only)')
+  }
+
+  environment {
+    TF_VAR_environment    = "${params.ENVIRONMENT}"
+    AWS_DEFAULT_REGION    = 'us-east-1'
+    TERRAGRUNT_VERSION    = '0.67.0'
+    TERRAFORM_VERSION     = '1.9.0'
+    WORKING_DIR           = "terragrunt/live/${params.CLOUD}"
+  }
+
+  options {
+    timeout(time: 90, unit: 'MINUTES')
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    disableConcurrentBuilds(abortPrevious: true)
+  }
+
+  stages {
+    stage('Validate') {
+      steps {
+        script {
+          if (params.DESTROY && params.ENVIRONMENT == 'production') {
+            error('DESTROY is not allowed on production via pipeline. Use break-glass procedure.')
+          }
+          if (params.AUTO_APPROVE && params.ENVIRONMENT == 'production') {
+            error('AUTO_APPROVE is not allowed on production.')
+          }
+        }
+      }
+    }
+
+    stage('Checkout') {
+      steps {
+        checkout scm
+        sh 'git log -1 --pretty=format:"%h %s" | tee .git-commit-info'
+      }
+    }
+
+    stage('Setup Tools') {
+      steps {
+        sh '''
+          # Install Terraform
+          if ! terraform version 2>/dev/null | grep -q "${TERRAFORM_VERSION}"; then
+            curl -sLo /tmp/terraform.zip https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+            unzip -o /tmp/terraform.zip -d /usr/local/bin/
+          fi
+
+          # Install Terragrunt
+          if ! terragrunt --version 2>/dev/null | grep -q "${TERRAGRUNT_VERSION}"; then
+            curl -sLo /usr/local/bin/terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}/terragrunt_linux_amd64
+            chmod +x /usr/local/bin/terragrunt
+          fi
+
+          terraform version
+          terragrunt --version
+          aws --version
+          helm version
+          kubectl version --client
+        '''
+      }
+    }
+
+    stage('Authenticate') {
+      steps {
+        withCredentials([
+          string(credentialsId: "aws-role-arn-${params.ENVIRONMENT}", variable: 'AWS_ROLE_ARN')
+        ]) {
+          sh '''
+            aws sts assume-role \
+              --role-arn "${AWS_ROLE_ARN}" \
+              --role-session-name "jenkins-${JOB_NAME}-${BUILD_NUMBER}" \
+              --duration-seconds 3600 \
+              --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+              --output text | read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+            export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+            aws sts get-caller-identity
+          '''
+        }
+      }
+    }
+
+    stage('Init') {
+      steps {
+        dir(env.WORKING_DIR) {
+          sh '''
+            if [ "${COMPONENT}" = "all" ]; then
+              terragrunt run-all init --terragrunt-non-interactive
+            else
+              cd ${COMPONENT} && terragrunt init --terragrunt-non-interactive
+            fi
+          '''
+        }
+      }
+    }
+
+    stage('Validate Config') {
+      steps {
+        dir(env.WORKING_DIR) {
+          sh '''
+            if [ "${COMPONENT}" = "all" ]; then
+              terragrunt run-all validate
+            else
+              cd ${COMPONENT} && terragrunt validate
+            fi
+          '''
+        }
+      }
+    }
+
+    stage('Plan') {
+      steps {
+        dir(env.WORKING_DIR) {
+          sh '''
+            PLAN_FLAGS=""
+            if [ "${DESTROY}" = "true" ]; then
+              PLAN_FLAGS="-destroy"
+            fi
+
+            if [ "${COMPONENT}" = "all" ]; then
+              terragrunt run-all plan ${PLAN_FLAGS} \
+                --terragrunt-non-interactive \
+                -out=tfplan \
+                2>&1 | tee plan.log
+            else
+              cd ${COMPONENT}
+              terragrunt plan ${PLAN_FLAGS} -out=tfplan 2>&1 | tee plan.log
+            fi
+          '''
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: "${env.WORKING_DIR}/**/plan.log", allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage('Approval') {
+      when {
+        anyOf {
+          expression { params.ENVIRONMENT == 'production' }
+          expression { params.ENVIRONMENT == 'staging' && !params.AUTO_APPROVE }
+        }
+      }
+      steps {
+        timeout(time: 30, unit: 'MINUTES') {
+          input message: "Approve ${params.DESTROY ? 'DESTROY' : 'apply'} to ${params.ENVIRONMENT}?",
+                ok: 'Approve',
+                submitter: 'platform-leads,sre-leads'
+        }
+      }
+    }
+
+    stage('Apply') {
+      steps {
+        dir(env.WORKING_DIR) {
+          sh '''
+            APPLY_CMD="apply tfplan"
+            if [ "${DESTROY}" = "true" ]; then
+              APPLY_CMD="destroy -auto-approve"
+            fi
+
+            if [ "${COMPONENT}" = "all" ]; then
+              terragrunt run-all ${APPLY_CMD} --terragrunt-non-interactive
+            else
+              cd ${COMPONENT}
+              terragrunt ${APPLY_CMD}
+            fi
+          '''
+        }
+      }
+    }
+
+    stage('Verify') {
+      when { expression { !params.DESTROY } }
+      steps {
+        sh '''
+          # Update kubeconfig
+          aws eks update-kubeconfig \
+            --name "payments-api-eks" \
+            --region "${AWS_DEFAULT_REGION}"
+
+          # Wait for all nodes ready
+          kubectl wait --for=condition=Ready nodes --all --timeout=300s
+
+          # Verify Kafka pods
+          kubectl wait --for=condition=Ready pods \
+            -l app.kubernetes.io/name=kafka \
+            -n kafka \
+            --timeout=300s
+
+          # Verify Kafka topics created
+          kubectl exec -n kafka kafka-broker-0 -- \
+            kafka-topics.sh \
+            --bootstrap-server kafka.kafka.svc.cluster.local:9092 \
+            --list
+
+          # Verify Prometheus up
+          kubectl wait --for=condition=Ready pods \
+            -l app.kubernetes.io/name=prometheus \
+            -n monitoring \
+            --timeout=120s
+
+          # Verify Grafana up
+          kubectl wait --for=condition=Ready pods \
+            -l app.kubernetes.io/name=grafana \
+            -n monitoring \
+            --timeout=120s
+
+          echo "All verifications passed"
+        '''
+      }
+    }
+  }
+
+  post {
+    success {
+      slackSend(
+        channel: '#payments-deployments',
+        color: 'good',
+        message: """
+          *${params.DESTROY ? 'DESTROY' : 'Deploy'} SUCCESS*
+          Environment: ${params.ENVIRONMENT} | Cloud: ${params.CLOUD} | Component: ${params.COMPONENT}
+          Build: <${BUILD_URL}|#${BUILD_NUMBER}>
+        """
+      )
+    }
+    failure {
+      slackSend(
+        channel: '#payments-deployments',
+        color: 'danger',
+        message: """
+          *${params.DESTROY ? 'DESTROY' : 'Deploy'} FAILED*
+          Environment: ${params.ENVIRONMENT} | Cloud: ${params.CLOUD} | Component: ${params.COMPONENT}
+          Build: <${BUILD_URL}|#${BUILD_NUMBER}>
+        """
+      )
+    }
+    always {
+      cleanWs()
+    }
+  }
+}
