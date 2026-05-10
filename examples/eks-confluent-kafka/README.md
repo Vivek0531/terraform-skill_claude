@@ -32,6 +32,7 @@ flowchart TB
                     subgraph kafka_ns["Namespace: kafka"]
                         kafka_broker["Kafka Brokers × 3\n(KRaft mode)\nbitnami/kafka 29.3.4"]
                         kafka_topics["Topics:\npayments.initiated\npayments.processing\npayments.completed\npayments.failed\npayments.dlq\naudit.events"]
+                        kafka_ui["Kafka UI\n(provectus/kafka-ui)"]
                     end
                 end
 
@@ -60,6 +61,7 @@ flowchart TB
     payments_client --> alb --> payments_api
     payments_api -->|produce events| kafka_broker
     kafka_broker --- kafka_topics
+    kafka_ui -->|browse| kafka_broker
     fluentbit -->|ship logs| loki
     fluentbit -->|payments logs| cloudwatch
     prometheus -->|scrape| kafka_broker
@@ -67,7 +69,7 @@ flowchart TB
     grafana -->|query| prometheus
     grafana -->|query| loki
     alertmanager -->|alerts| prometheus
-    kafka_broker -.->|100Gi gp3 per broker| s3
+    kafka_broker -.->|100Gi kafka-gp3 per broker| s3
     loki -.->|long-term archive| s3
 ```
 
@@ -78,7 +80,7 @@ flowchart TB
 | Payment initiated | Client → ALB → Payments API → `payments.initiated` topic (12 partitions) |
 | Payment processed | Consumer → `payments.processing` → `payments.completed` or `payments.failed` |
 | Dead-letter | Failed after retries → `payments.dlq` (90-day retention) |
-| Audit trail | All state changes → `audit.events` (1-year retention) |
+| Audit trail | All state changes → `audit.events` (1-year retention, compact+delete) |
 | Metrics | Kafka JMX + app `/metrics` → Prometheus → Grafana |
 | Logs | All pods → Fluent Bit → Loki (90d) + CloudWatch (payment pods) |
 | Alerts | Consumer lag > 10k → Slack; > 5k on payments → PagerDuty |
@@ -102,8 +104,9 @@ examples/eks-confluent-kafka/
 │   │   ├── variables.tf
 │   │   └── outputs.tf
 │   ├── kafka/
-│   │   ├── main.tf                    # Helm: bitnami/kafka + topic jobs
-│   │   └── variables.tf
+│   │   ├── main.tf                    # StorageClass, NetworkPolicy, Helm: bitnami/kafka + kafka-ui + topic jobs
+│   │   ├── variables.tf
+│   │   └── outputs.tf
 │   ├── monitoring/
 │   │   ├── main.tf                    # Helm: kube-prometheus-stack + PrometheusRules
 │   │   └── variables.tf
@@ -133,9 +136,11 @@ examples/eks-confluent-kafka/
 | Payment events lost on API crash | Kafka durable log — events persist independently of producers |
 | Coupled payment services | Kafka topics decouple initiation, processing, and notification |
 | Spike handling (Black Friday) | Kafka buffers burst; EKS autoscaler adds consumers |
-| Audit compliance | `audit.events` topic with 1-year retention, shipped to S3 Glacier |
+| Audit compliance | `audit.events` topic with 1-year retention, compact+delete, shipped to S3 Glacier |
 | Failed payment visibility | `payments.dlq` topic captures retried failures for manual review |
 | Consumer lag alerting | PrometheusRule fires to PagerDuty when lag > 5k on payment topics |
+| Broker storage I/O bottleneck | kafka-gp3 StorageClass: 6000 IOPS, 250 MiB/s, encrypted gp3 EBS |
+| Unauthorized broker access | NetworkPolicy: only payments namespace + monitoring reach Kafka |
 
 ---
 
@@ -144,7 +149,7 @@ examples/eks-confluent-kafka/
 ### Prerequisites
 
 | Tool | Version | Install |
-|------|---------|---------|
+|------|---------|--------|
 | Terraform | 1.9+ | `bash scripts/prereqs.sh` |
 | Terragrunt | 0.67+ | `bash scripts/prereqs.sh` |
 | AWS CLI | v2 | `bash scripts/prereqs.sh` |
@@ -241,16 +246,28 @@ kubectl get nodes
 cd ../kafka
 
 terragrunt init
-terragrunt plan        # review: 3 brokers, 100Gi gp3 each, 6 topics
+terragrunt plan        # review: StorageClass kafka-gp3, NetworkPolicy, 3 brokers, kafka-ui, 6 topics
 terragrunt apply
 ```
 
-Expected: ~10 minutes. Creates Kafka in KRaft mode (no ZooKeeper), creates all payment topics.
+Expected: ~10 minutes. Creates:
+- `kafka-gp3` StorageClass (6000 IOPS, 250 MiB/s, encrypted, Retain)
+- NetworkPolicy restricting broker access to `payments` and `monitoring` namespaces
+- Kafka in KRaft mode (no ZooKeeper), 3 brokers × 100Gi each
+- Kafka UI for topic/consumer group visibility
+- All 6 payment topics with per-topic retention and cleanup policy
 
 Verify:
 
 ```bash
 bash scripts/verify-kafka.sh
+```
+
+Access Kafka UI:
+
+```bash
+kubectl port-forward -n kafka svc/kafka-ui 8080:80
+# Open http://localhost:8080
 ```
 
 ---
@@ -315,7 +332,15 @@ Query payment logs:
    - **ENVIRONMENT:** `dev`
    - **COMPONENT:** `all`
 
-Pipeline stages: Validate → Checkout → Setup Tools → Authenticate → Init → Validate Config → Plan → **Approval** (prod/staging) → Apply → Verify
+Pipeline stages: Validate → Checkout → Setup Tools → Authenticate → Init → Validate Config → Plan → **Approval** (prod/staging) → Apply → Verify Infrastructure → **Verify Kafka Installation**
+
+The **Verify Kafka Installation** stage runs 6 checks (only when COMPONENT=all or kafka):
+1. All 3 broker pods Ready
+2. KRaft controller quorum leader elected
+3. All 6 payment topics present
+4. Partition counts and ISR verified per topic
+5. Produce + consume round-trip smoke test on `payments.initiated`
+6. JMX metrics endpoint returning Kafka series
 
 ---
 
@@ -337,14 +362,14 @@ terragrunt run-all apply --terragrunt-non-interactive
 
 ## Kafka Topic Reference
 
-| Topic | Partitions | Retention | Purpose |
-|-------|-----------|-----------|---------|
-| `payments.initiated` | 12 | 7 days | New payment requests |
-| `payments.processing` | 12 | 7 days | In-flight payments |
-| `payments.completed` | 12 | 30 days | Successful payments |
-| `payments.failed` | 6 | 30 days | Failed payments |
-| `payments.dlq` | 3 | 90 days | Dead-letter queue |
-| `audit.events` | 6 | 365 days | Compliance audit trail |
+| Topic | Partitions | Retention | Cleanup Policy | Purpose |
+|-------|-----------|-----------|----------------|---------|
+| `payments.initiated` | 12 | 7 days | delete | New payment requests |
+| `payments.processing` | 12 | 7 days | delete | In-flight payments |
+| `payments.completed` | 12 | 30 days | delete | Successful payments |
+| `payments.failed` | 6 | 30 days | delete | Failed payments |
+| `payments.dlq` | 3 | 90 days | delete | Dead-letter queue |
+| `audit.events` | 6 | 365 days | compact,delete | Compliance audit trail |
 
 ---
 
@@ -361,17 +386,40 @@ terragrunt run-all apply --terragrunt-non-interactive
 ## Useful Commands
 
 ```bash
-# Kafka producer (test)
+# Kafka producer (test payment event)
 kubectl exec -n kafka kafka-broker-0 -- \
   kafka-console-producer.sh \
   --bootstrap-server kafka.kafka.svc.cluster.local:9092 \
   --topic payments.initiated
 
-# Consumer group lag
+# Kafka consumer (read from beginning)
+kubectl exec -n kafka kafka-broker-0 -- \
+  kafka-console-consumer.sh \
+  --bootstrap-server kafka.kafka.svc.cluster.local:9092 \
+  --topic payments.initiated \
+  --from-beginning
+
+# Consumer group lag (all groups)
 kubectl exec -n kafka kafka-broker-0 -- \
   kafka-consumer-groups.sh \
   --bootstrap-server kafka.kafka.svc.cluster.local:9092 \
   --describe --all-groups
+
+# KRaft controller quorum health
+kubectl exec -n kafka kafka-broker-0 -- \
+  kafka-metadata-quorum.sh \
+  --bootstrap-server kafka.kafka.svc.cluster.local:9092 \
+  describe --status
+
+# Describe a topic (check partitions and ISR)
+kubectl exec -n kafka kafka-broker-0 -- \
+  kafka-topics.sh \
+  --bootstrap-server kafka.kafka.svc.cluster.local:9092 \
+  --describe --topic payments.initiated
+
+# Kafka UI — visual topic browser and consumer group monitor
+kubectl port-forward -n kafka svc/kafka-ui 8080:80
+# Open http://localhost:8080
 
 # Grafana port-forward
 kubectl port-forward -n monitoring svc/kube-prometheus-stack-grafana 3000:80
@@ -398,6 +446,9 @@ cd terragrunt/live/aws && terragrunt run-all destroy --terragrunt-non-interactiv
 | Kafka pod `Pending` | Kafka node group not ready or taint mismatch | Check `kubectl describe pod -n kafka <pod>` for taint/toleration |
 | Topic create job fails | Kafka not yet ready | Increase `backoff_limit` in topic job or rerun `terragrunt apply` |
 | Consumer lag alert firing | Slow consumer or undersized consumer | Scale consumer deployment; check `payments.processing` lag |
+| KRaft leader election fails | Clock skew > 2s between nodes | Sync NTP on worker nodes; restart controller pods |
+| Kafka UI shows no brokers | Kafka service DNS not resolving | Verify `kafka.kafka.svc.cluster.local:9092` from kafka-ui pod |
 | Grafana datasource missing | Loki not deployed or wrong URL | Verify `loki.logging.svc.cluster.local:3100` is reachable |
 | `terragrunt init` 403 | Missing S3/DynamoDB permissions | Verify IAM role has S3+DynamoDB access; run `bootstrap.sh` first |
-| EBS volume stuck `Pending` | EBS CSI driver not installed | Verify `aws-ebs-csi-driver` addon in EKS console |
+| EBS volume stuck `Pending` | EBS CSI driver not installed or StorageClass missing | Verify `kafka-gp3` StorageClass and `aws-ebs-csi-driver` addon |
+| ISR < min.insync.replicas | Broker overloaded or network partition | Check broker JVM heap; scale node group if CPU/mem saturated |

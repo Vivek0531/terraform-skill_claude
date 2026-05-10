@@ -25,13 +25,26 @@ variable "kafka_config" {
 
 variable "topics" {
   type = list(object({
-    name         = string
-    partitions   = number
-    replication  = number
-    retention_ms = number
+    name            = string
+    partitions      = number
+    replication     = number
+    retention_ms    = number
+    cleanup_policy  = optional(string, "delete")
   }))
   default = []
 }
 
 variable "node_selector" { type = map(string); default = {} }
 variable "tolerations"   { type = list(any);   default = [] }
+
+variable "enable_kafka_ui" {
+  description = "Deploy Kafka UI (provectus/kafka-ui) for topic and consumer group visibility"
+  type        = bool
+  default     = true
+}
+
+variable "kafka_ui_chart_version" {
+  description = "Helm chart version for provectus/kafka-ui"
+  type        = string
+  default     = "0.7.6"
+}

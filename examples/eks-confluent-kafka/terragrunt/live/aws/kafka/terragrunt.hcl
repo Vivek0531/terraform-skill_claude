@@ -32,13 +32,16 @@ inputs = {
     max_message_bytes     = 10485760  # 10MB for payment events
   }
 
+  enable_kafka_ui        = true
+  kafka_ui_chart_version = "0.7.6"
+
   topics = [
-    { name = "payments.initiated",  partitions = 12, replication = 3, retention_ms = 604800000 },
-    { name = "payments.processing", partitions = 12, replication = 3, retention_ms = 604800000 },
-    { name = "payments.completed",  partitions = 12, replication = 3, retention_ms = 2592000000 },  # 30 days
-    { name = "payments.failed",     partitions = 6,  replication = 3, retention_ms = 2592000000 },
-    { name = "payments.dlq",        partitions = 3,  replication = 3, retention_ms = 7776000000 },  # 90 days
-    { name = "audit.events",        partitions = 6,  replication = 3, retention_ms = 31536000000 }, # 1 year
+    { name = "payments.initiated",  partitions = 12, replication = 3, retention_ms = 604800000,   cleanup_policy = "delete" },
+    { name = "payments.processing", partitions = 12, replication = 3, retention_ms = 604800000,   cleanup_policy = "delete" },
+    { name = "payments.completed",  partitions = 12, replication = 3, retention_ms = 2592000000,  cleanup_policy = "delete" },  # 30 days
+    { name = "payments.failed",     partitions = 6,  replication = 3, retention_ms = 2592000000,  cleanup_policy = "delete" },
+    { name = "payments.dlq",        partitions = 3,  replication = 3, retention_ms = 7776000000,  cleanup_policy = "delete" },  # 90 days
+    { name = "audit.events",        partitions = 6,  replication = 3, retention_ms = 31536000000, cleanup_policy = "compact,delete" }, # 1 year, compacted for audit
   ]
 
   storage_class = "gp3"

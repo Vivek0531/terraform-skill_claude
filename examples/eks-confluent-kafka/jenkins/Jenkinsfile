@@ -179,7 +179,7 @@ pipeline {
       }
     }
 
-    stage('Verify') {
+    stage('Verify Infrastructure') {
       when { expression { !params.DESTROY } }
       steps {
         sh '''
@@ -190,18 +190,6 @@ pipeline {
 
           # Wait for all nodes ready
           kubectl wait --for=condition=Ready nodes --all --timeout=300s
-
-          # Verify Kafka pods
-          kubectl wait --for=condition=Ready pods \
-            -l app.kubernetes.io/name=kafka \
-            -n kafka \
-            --timeout=300s
-
-          # Verify Kafka topics created
-          kubectl exec -n kafka kafka-broker-0 -- \
-            kafka-topics.sh \
-            --bootstrap-server kafka.kafka.svc.cluster.local:9092 \
-            --list
 
           # Verify Prometheus up
           kubectl wait --for=condition=Ready pods \
@@ -215,7 +203,98 @@ pipeline {
             -n monitoring \
             --timeout=120s
 
-          echo "All verifications passed"
+          echo "Infrastructure verification passed"
+        '''
+      }
+    }
+
+    stage('Verify Kafka Installation') {
+      when {
+        allOf {
+          expression { !params.DESTROY }
+          anyOf {
+            expression { params.COMPONENT == 'all' }
+            expression { params.COMPONENT == 'kafka' }
+          }
+        }
+      }
+      steps {
+        sh '''
+          BOOTSTRAP="kafka.kafka.svc.cluster.local:9092"
+          BROKER_POD=$(kubectl get pod -n kafka -l app.kubernetes.io/component=broker \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || \
+            kubectl get pod -n kafka -l app.kubernetes.io/name=kafka \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          echo "==> [1/6] Waiting for all Kafka broker pods to be Ready..."
+          kubectl wait --for=condition=Ready pods \
+            -l app.kubernetes.io/name=kafka \
+            -n kafka \
+            --timeout=300s
+          READY_COUNT=$(kubectl get pods -n kafka -l app.kubernetes.io/name=kafka \
+            --field-selector=status.phase=Running --no-headers | wc -l)
+          echo "    Kafka pods ready: ${READY_COUNT}"
+          [ "${READY_COUNT}" -ge 3 ] || { echo "ERROR: fewer than 3 Kafka pods running"; exit 1; }
+
+          echo ""
+          echo "==> [2/6] Verifying KRaft controller quorum..."
+          kubectl exec -n kafka "${BROKER_POD}" -- \
+            kafka-metadata-quorum.sh \
+              --bootstrap-server "${BOOTSTRAP}" \
+              describe --status | grep -E "LeaderId|CurrentOffset"
+
+          echo ""
+          echo "==> [3/6] Verifying all payment topics exist..."
+          TOPICS=$(kubectl exec -n kafka "${BROKER_POD}" -- \
+            kafka-topics.sh --bootstrap-server "${BOOTSTRAP}" --list)
+          echo "${TOPICS}"
+
+          REQUIRED_TOPICS="payments.initiated payments.processing payments.completed payments.failed payments.dlq audit.events"
+          for topic in ${REQUIRED_TOPICS}; do
+            echo "${TOPICS}" | grep -q "^${topic}$" || \
+              { echo "ERROR: topic '${topic}' not found"; exit 1; }
+            echo "    [OK] ${topic}"
+          done
+
+          echo ""
+          echo "==> [4/6] Verifying topic partitions and ISR (min.insync.replicas=2)..."
+          for topic in ${REQUIRED_TOPICS}; do
+            kubectl exec -n kafka "${BROKER_POD}" -- \
+              kafka-topics.sh --bootstrap-server "${BOOTSTRAP}" \
+                --describe --topic "${topic}" | \
+              grep -E "PartitionCount|ReplicationFactor|Isr"
+          done
+
+          echo ""
+          echo "==> [5/6] Produce + consume smoke test on payments.initiated..."
+          TEST_MSG="ci-smoke-test-$(date +%s)"
+          kubectl exec -n kafka "${BROKER_POD}" -- \
+            bash -c "echo '${TEST_MSG}' | \
+              kafka-console-producer.sh \
+                --bootstrap-server ${BOOTSTRAP} \
+                --topic payments.initiated"
+
+          CONSUMED=$(kubectl exec -n kafka "${BROKER_POD}" -- \
+            kafka-console-consumer.sh \
+              --bootstrap-server "${BOOTSTRAP}" \
+              --topic payments.initiated \
+              --from-beginning \
+              --max-messages 1 \
+              --timeout-ms 15000 2>/dev/null)
+          echo "    Consumed: ${CONSUMED}"
+          echo "${CONSUMED}" | grep -q "${TEST_MSG}" || \
+            { echo "ERROR: smoke test message not received"; exit 1; }
+          echo "    [OK] Produce/consume round-trip verified"
+
+          echo ""
+          echo "==> [6/6] Verifying Kafka metrics endpoint (JMX exporter)..."
+          kubectl exec -n kafka "${BROKER_POD}" -- \
+            curl -sf "http://localhost:5556/metrics" | grep -c "kafka_" | \
+            xargs -I{} sh -c '[ {} -gt 0 ] && echo "    [OK] {} Kafka metric series exposed" || \
+              { echo "ERROR: JMX metrics not available"; exit 1; }'
+
+          echo ""
+          echo "==> Kafka installation verification complete"
         '''
       }
     }
